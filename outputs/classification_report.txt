@@ -1,0 +1,16 @@
+Accuracy: 0.8739
+Macro-F1: 0.7589
+
+                             precision    recall  f1-score   support
+
+                     Normal      0.980     1.000     0.990       240
+                       Sour      0.731     0.760     0.745        25
+                      Black      0.875     0.667     0.757        21
+              Insect Damage      0.650     0.591     0.619        22
+            Physical Damage      0.735     0.676     0.704        37
+     Immature/Discoloration      0.703     0.765     0.732        34
+Foreign Material/Processing      0.759     0.772     0.765        57
+
+                   accuracy                          0.874       436
+                  macro avg      0.776     0.747     0.759       436
+               weighted avg      0.872     0.874     0.872       436
