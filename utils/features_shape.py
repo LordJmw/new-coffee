@@ -54,13 +54,22 @@ def detect_insect_holes_small(original_gray, original_rgb, main_contour, main_ar
     """
     Track B: titik gelap kecil (titik masuk serangga).
 
-    REVISI: selain kontur & area, sekarang juga menghitung circularity dan
-    kontras kegelapan tiap titik (dikembalikan lewat hole_meta), agar
-    features_shape bisa membedakan lubang serangga asli (bulat, kontras
-    gelap tajam thd jaringan sekitar) dari false-positive umum pada biji
-    Normal/Withered (garis lipatan/bayangan di tepi, cenderung memanjang
-    & kontras lebih halus) -- bukan lagi dibuang dengan threshold keras,
-    tapi diserahkan sebagai fitur numerik ke Random Forest.
+    REVISI (jawab pertanyaan "apakah pakai Otsu?"): sebelumnya Track B TIDAK
+    memakai Otsu sama sekali - hanya threshold statistik flat (median - k*std)
+    yang diterapkan RATA ke seluruh biji. Itu sebabnya kontur lubang yang
+    divisualisasikan sering "tidak pas" di app.py: satu angka threshold
+    global tidak mengikuti gradien pencahayaan lokal di sekitar lubang,
+    sehingga tepi kontur jadi blok kasar, bukan menempel ke tepi lubang asli.
+
+    Sekarang dipakai 2 langkah agar kontur lebih presisi:
+      1. Black-hat morphological transform pada grayscale (dalam bbox biji) -
+         menonjolkan struktur gelap KECIL relatif terhadap latar lokal di
+         sekitarnya (bukan relatif ke rata-rata seluruh biji), sehingga
+         tahan terhadap gradasi warna alami permukaan biji.
+      2. Otsu diterapkan PADA RESPON BLACK-HAT tersebut (bukan pada
+         grayscale mentah, dan bukan pada seluruh frame) -> ambang otomatis
+         yang mengikuti kontras lokal tiap biji, hasil kontur lebih menempel
+         ke tepi lubang asli dibanding threshold statistik flat sebelumnya.
     """
     img_h, img_w = original_gray.shape[:2]
     bx, by, bw, bh = cv2.boundingRect(main_contour)
@@ -70,51 +79,84 @@ def detect_insect_holes_small(original_gray, original_rgb, main_contour, main_ar
 
     median_intensity = float(np.median(bean_pixels))
     std_intensity = float(np.std(bean_pixels))
-    dark_threshold = max(30, min(100, median_intensity - 2.2 * std_intensity))
 
-    dark_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-    dark_mask[(original_gray < dark_threshold) & (bean_mask == 255)] = 255
-    if cv2.countNonZero(dark_mask) == 0:
+    # ── Black-hat: kernel selebar lubang serangga tipikal (biji 224x224) ──
+    pad = 6
+    x1, y1 = max(0, bx - pad), max(0, by - pad)
+    x2, y2 = min(img_w, bx + bw + pad), min(img_h, by + bh + pad)
+    crop_gray = original_gray[y1:y2, x1:x2]
+    crop_mask = bean_mask[y1:y2, x1:x2]
+    if crop_gray.size == 0:
         return [], [], []
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    blackhat = cv2.morphologyEx(crop_gray, cv2.MORPH_BLACKHAT, kernel)
+    # Nolkan respon di luar mask biji supaya tidak ikut mempengaruhi ambang Otsu
+    blackhat_masked = blackhat.copy()
+    blackhat_masked[crop_mask != 255] = 0
+
+    if blackhat_masked.max() < 8:  # nyaris tidak ada struktur gelap lokal -> tidak ada lubang
+        return [], [], []
+
+    # Otsu HANYA pada respon black-hat di dalam mask biji (bukan seluruh frame)
+    bean_blackhat_vals = blackhat_masked[crop_mask == 255]
+    otsu_thresh, _ = cv2.threshold(
+        bean_blackhat_vals.reshape(-1, 1).astype(np.uint8), 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    local_contrast_mask = blackhat_masked >= otsu_thresh
+
+    # Gabungkan dengan syarat kegelapan absolut (relatif median seluruh biji)
+    # supaya hanya tekstur permukaan yang JUGA benar-benar gelap yang lolos -
+    # black-hat sendirian bisa terlalu sensitif pada variasi tekstur
+    # permukaan yang halus (bukan lubang sungguhan), jadi dua sinyal
+    # (kontras lokal + kegelapan absolut) harus sepakat.
+    absolute_dark_thresh = max(30, min(110, median_intensity - 1.3 * std_intensity))
+    absolute_dark_mask = crop_gray < absolute_dark_thresh
+
+    dark_mask = np.zeros_like(crop_gray, dtype=np.uint8)
+    dark_mask[local_contrast_mask & absolute_dark_mask & (crop_mask == 255)] = 255
 
     k = np.ones((3, 3), np.uint8)
     dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k, iterations=1)
-    spot_contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    spot_contours_crop, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     hole_contours, hole_areas, hole_meta = [], [], []
-    for sc in spot_contours:
-        s_area = cv2.contourArea(sc)
+    for sc_crop in spot_contours_crop:
+        s_area = cv2.contourArea(sc_crop)
         if not (3 <= s_area <= 80):
             continue
         if s_area / main_area > 0.03:
             continue
-        s_perim = cv2.arcLength(sc, True)
+        s_perim = cv2.arcLength(sc_crop, True)
         if s_perim == 0:
             continue
         s_circ = (4 * np.pi * s_area) / (s_perim ** 2)
         if s_circ < 0.25:
             continue
-        M = cv2.moments(sc)
+        M = cv2.moments(sc_crop)
         if M['m00'] == 0:
             continue
-        cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
+        cx_crop, cy_crop = M['m10'] / M['m00'], M['m01'] / M['m00']
+        cx, cy = cx_crop + x1, cy_crop + y1  # balik ke koordinat frame penuh
         margin = 8
         if not (bx + margin < cx < bx + bw - margin and by + margin < cy < by + bh - margin):
             continue
-        spot_mask_single = np.zeros((img_h, img_w), dtype=np.uint8)
-        cv2.drawContours(spot_mask_single, [sc], -1, 255, -1)
-        spot_pixels = original_gray[spot_mask_single == 255]
-        if spot_pixels.size == 0 or np.mean(spot_pixels) > dark_threshold + 15:
-            continue
-        spot_rgb = original_rgb[spot_mask_single == 255]
-        if spot_rgb.size > 0 and spot_rgb.mean(axis=0).max() > 120:
-            continue
 
-        # Kontras kegelapan relatif thd median jaringan sekitar biji
-        contrast = float(median_intensity - np.mean(spot_pixels)) if spot_pixels.size > 0 else 0.0
+        spot_mask_single = np.zeros_like(crop_gray, dtype=np.uint8)
+        cv2.drawContours(spot_mask_single, [sc_crop], -1, 255, -1)
+        spot_pixels = crop_gray[spot_mask_single == 255]
+        if spot_pixels.size == 0:
+            continue
+        crop_rgb = original_rgb[y1:y2, x1:x2]
+        spot_rgb = crop_rgb[spot_mask_single == 255]
+        if spot_rgb.size > 0 and spot_rgb.mean(axis=0).max() > 130:
+            continue  # terlalu terang untuk lubang serangga asli
 
-        hole_contours.append(sc)
+        contrast = float(median_intensity - np.mean(spot_pixels))
+        sc_full = sc_crop + np.array([[x1, y1]])  # translasi kontur ke koordinat frame penuh
+
+        hole_contours.append(sc_full)
         hole_areas.append(s_area)
         hole_meta.append({'circularity': float(s_circ), 'contrast': contrast})
 
@@ -180,7 +222,8 @@ def find_main_bean_contour(binary_img):
 # ─────────────────────────────────────────────────────────────────────────
 
 SHAPE_FEATURE_NAMES = [
-    'area', 'perimeter', 'circularity', 'solidity', 'extent', 'aspect_ratio',
+    'area', 'perimeter', 'circularity', 'solidity', 'convexity', 'extent',
+    'aspect_ratio', 'eccentricity',
     'holes_count', 'holes_area_ratio', 'holes_mean_area',
     'holes_circularity_mean', 'holes_contrast_mean', 'holes_contrast_max',
     'hu1', 'hu2', 'hu3', 'hu4', 'hu5', 'hu6', 'hu7',
@@ -195,7 +238,7 @@ def extract_shape_features(binary_img, original_gray, original_rgb):
     """
     empty = {name: 0.0 for name in SHAPE_FEATURE_NAMES}
     empty.update({'is_valid': False, 'contour': None, 'bean_mask': None,
-                  'bbox': None, 'hole_contours': [], 'hole_areas': []})
+                  'bbox': None, 'hole_contours': [], 'hole_areas': [], 'hole_meta': []})
 
     contours, hierarchy, main_idx, max_area = find_main_bean_contour(binary_img)
     if main_idx == -1:
@@ -205,10 +248,34 @@ def extract_shape_features(binary_img, original_gray, original_rgb):
     perimeter = cv2.arcLength(cnt, True)
     x, y, w, h = cv2.boundingRect(cnt)
     aspect_ratio = float(w) / h if h > 0 else 0
-    hull_area = cv2.contourArea(cv2.convexHull(cnt))
+    hull = cv2.convexHull(cnt)
+    hull_area = cv2.contourArea(hull)
+    hull_perimeter = cv2.arcLength(hull, True)
     solidity = float(max_area) / hull_area if hull_area > 0 else 0
+    # Convexity: rasio KELILING hull vs kontur asli - komplementer thd solidity
+    # (yang berbasis LUAS). Solidity bisa "tidak sensitif" pada cekungan kecil
+    # tapi rapat (area yang hilang sedikit), sedangkan convexity langsung
+    # menangkap kekasaran/gerigi tepi kontur (perimeter jadi lebih panjang
+    # dari hull-nya) - berguna untuk Broken/Cut/Shell yang tepi patahannya
+    # tajam & tidak beraturan meski areanya tidak banyak berkurang.
+    convexity = float(hull_perimeter) / perimeter if perimeter > 0 else 0
     extent = float(max_area) / (w * h) if w * h > 0 else 0
     circularity = (4 * np.pi * max_area) / (perimeter ** 2) if perimeter > 0 else 0
+
+    # Eccentricity dari ellipse-fit: lebih tepat dari aspect_ratio (bounding-box)
+    # karena TIDAK bergantung pada orientasi/rotasi biji di dalam frame -
+    # penting karena biji hasil crop YOLO (domain target) orientasinya acak,
+    # beda dari kondisi lab yang mungkin lebih terkontrol.
+    eccentricity = 0.0
+    if len(cnt) >= 5:  # fitEllipse butuh minimal 5 titik
+        try:
+            (_, _), (ma, MA), _ = cv2.fitEllipse(cnt)
+            ma, MA = min(ma, MA), max(ma, MA)
+            if MA > 0:
+                ratio_sq = (ma / MA) ** 2
+                eccentricity = float(np.sqrt(max(0.0, 1 - ratio_sq)))
+        except cv2.error:
+            eccentricity = 0.0
 
     img_h, img_w = original_rgb.shape[:2]
     bean_mask = np.zeros((img_h, img_w), dtype=np.uint8)
@@ -248,8 +315,10 @@ def extract_shape_features(binary_img, original_gray, original_rgb):
         'perimeter': float(perimeter),
         'circularity': float(circularity),
         'solidity': float(solidity),
+        'convexity': float(convexity),
         'extent': float(extent),
         'aspect_ratio': float(aspect_ratio),
+        'eccentricity': eccentricity,
         'holes_count': int(holes_count),
         'holes_area_ratio': float(holes_area_ratio),
         'holes_mean_area': float(holes_mean_area),
@@ -261,6 +330,7 @@ def extract_shape_features(binary_img, original_gray, original_rgb):
         'bbox': (x, y, w, h),
         'hole_contours': hole_contours,
         'hole_areas': hole_areas,
+        'hole_meta': hole_meta,
     }
     for i, v in enumerate(hu_log, start=1):
         features[f'hu{i}'] = v

@@ -1,111 +1,112 @@
 # utils/visualization.py
 """
-Visualisasi tambahan untuk Tab "Penilaian Model" di app.py.
+Helper visualisasi untuk app.py.
 
-CATATAN PENTING soal create_decision_boundary_plot():
-Random Forest produksi dilatih di ruang fitur ~90 dimensi (ALL_FEATURE_NAMES
-dari utils/features_combine.py), jadi decision boundary-nya sendiri tidak
-bisa digambar langsung dalam 2D. Pendekatan yang dipakai di sini adalah
-teknik umum untuk memvisualisasikan model non-linear di ruang fitur tinggi:
+PENTING - jawaban untuk pertanyaan "kenapa visualisasi lubang tidak pas":
 
-    1. Reduksi fitur ASLI ke 2D lewat PCA (2 komponen varians terbesar).
-    2. Latih SURROGATE RandomForest baru khusus di ruang PCA 2D tsb - ini
-       BUKAN model produksi, hanya aproksimasi bentuk keputusan model asli
-       pada proyeksi 2D, murni untuk keperluan visualisasi/interpretasi.
-    3. Gambar contourf region keputusan surrogate + scatter titik data asli
-       (warna = label sebenarnya) di atasnya.
+1. Segmentasi biji-vs-background (kontur hijau) memang pakai Otsu GLOBAL
+   (satu ambang untuk seluruh frame 224x224) - lihat
+   utils/preprocessing.apply_threshold(). Ini cukup untuk memisahkan biji
+   dari latar putih karena kontrasnya besar & konsisten.
 
-Karena surrogate dilatih ulang di ruang 2D (bukan proyeksi dari model asli),
-batas yang tergambar adalah APROKSIMASI kasar, bukan representasi eksak dari
-RF 90-dimensi yang sesungguhnya dipakai untuk prediksi. Fungsi ini murni
-alat bantu eksplorasi visual, bukan bukti akurasi model.
+2. Deteksi lubang serangga (kontur merah) TIDAK memakai Otsu global yang
+   sama. Versi sebelumnya bahkan tidak memakai Otsu sama sekali (cuma
+   ambang statistik flat: median - k*std, rata ke seluruh biji) - itu
+   sebabnya kontur yang tergambar sering "blok kasar", tidak menempel ke
+   tepi lubang asli: satu angka ambang tidak mengikuti gradien pencahayaan
+   lokal berbeda-beda di tiap titik permukaan biji.
+
+   Revisi saat ini (features_shape.detect_insect_holes_small) memakai
+   black-hat morphological transform + Otsu LOKAL (dihitung hanya dari
+   respons black-hat di dalam mask biji, bukan grayscale mentah / bukan
+   seluruh frame) supaya ambang mengikuti kontras lokal tiap biji.
+
+   CATATAN JUJUR: permukaan biji kopi kering secara alami punya kerutan/
+   center-cut yang juga menciptakan kontras gelap lokal, sehingga deteksi
+   berbasis threshold klasik (apa pun variannya) tetap akan menghasilkan
+   sejumlah false-positive pada biji Normal/Withered. Ini bukan bug yang
+   "bisa dihilangkan total" dengan tweak threshold - ini keterbatasan
+   mendasar computer vision klasik pada citra resolusi rendah (224x224).
+   Karena itu, pipeline SAAT INI TIDAK menggunakan holes_count sebagai
+   aturan keputusan tunggal (beda dari classify_coffee_bean() versi lama
+   yang langsung men-declare "Severe Insect Damage" bila holes>=1) -
+   holes_count/circularity/contrast hanyalah SALAH SATU dari puluhan fitur
+   yang dipelajari Random Forest, sehingga false-positive tunggal tidak
+   otomatis salah klasifikasi.
+
+   Untuk TAMPILAN visual saja (bukan untuk fitur RF), fungsi di bawah
+   memfilter lubang yang digambar dengan confidence score, supaya app.py
+   tidak menampilkan kontur yang lemah/meragukan ke pengguna.
 """
 
+import cv2
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-
-_PALETTE = [
-    "#4C72B0", "#DD8452", "#55A868", "#C44E52",
-    "#8172B2", "#937860", "#DA8BC3",
-]
 
 
-def create_decision_boundary_plot(X, y, feature_names=None, classes=None,
-                                   random_state=42, mesh_step=0.02,
-                                   n_estimators=200, figsize=(8, 6)):
+def hole_confidence(meta: dict) -> float:
     """
-    Bangun matplotlib Figure berisi decision boundary surrogate 2D (lihat
-    catatan modul di atas) untuk sekumpulan sampel fitur + label kelas.
+    Skor kepercayaan 0-1 kasar untuk satu lubang terdeteksi, dari circularity,
+    contrast, DAN (REVISI) elongation & solidity - lubang asli mendekati
+    bulat & solid, fragmen center-cut/keretakan cenderung memanjang &
+    kurang solid meski kontrasnya gelap tajam. Ditambahkan setelah
+    percobaan menaruh filter ini di lapisan deteksi (features_shape.py)
+    terbukti menghapus sinyal keretakan asli yang dipakai RF untuk kelas
+    lain (Broken/Cut/Shell/Black) - jadi elongation/solidity HANYA dipakai
+    di sini (murni tampilan), tidak lagi jadi gate keras di deteksi.
+    Hanya untuk keperluan TAMPILAN (filter kontur mana yang digambar) -
+    bukan dipakai sebagai fitur RF (RF memakai nilai mentahnya langsung).
+    """
+    circ_score = np.clip(meta.get('circularity', 0.0) / 0.85, 0, 1)
+    contrast_score = np.clip(meta.get('contrast', 0.0) / 80.0, 0, 1)
+    elongation = meta.get('elongation', 1.0)
+    elong_score = np.clip(1.0 - (elongation - 1.0) / 1.2, 0, 1)  # 1.0->1.0 ; >=2.2->~0
+    solidity_score = np.clip((meta.get('solidity', 1.0) - 0.5) / 0.4, 0, 1)  # 0.5->0 ; 0.9->1.0
+    return float(0.35 * circ_score + 0.25 * contrast_score
+                 + 0.25 * elong_score + 0.15 * solidity_score)
+
+
+def draw_detection_overlay(rgb_img, shape_feats, min_hole_confidence=0.5,
+                            bean_color=(0, 255, 0), hole_color=(255, 40, 40),
+                            thickness=1):
+    """
+    Gambar kontur biji + kontur lubang (yang confidence-nya >= threshold)
+    di atas rgb_img. Pengganti langsung 'viz_image' yang dulu dikembalikan
+    oleh features.py lama - dipisah jadi fungsi sendiri karena visualisasi
+    adalah kebutuhan UI (app.py), bukan bagian dari vektor fitur RF.
 
     Parameters
     ----------
-    X : array (n_samples, n_features) - fitur ASLI, boleh langsung fitur
-        ~90 dimensi dari CSV/model (direduksi PCA secara internal).
-    y : array (n_samples,) - label kelas final (string), dipakai untuk
-        warna titik & melatih surrogate.
-    feature_names : opsional, tidak dipakai untuk plotting - disediakan
-        supaya pemanggil boleh lewatkan nama kolom tanpa error (mis. untuk
-        anotasi/logging di luar fungsi ini).
-    classes : opsional, urutan kelas untuk warna & legenda. Default:
-        urutan terurut (sorted) dari nilai unik y.
-
-    Returns
-    -------
-    fig : matplotlib.figure.Figure - siap dipakai lewat st.pyplot(fig).
+    rgb_img : citra RGB dasar untuk digambar (biasanya pre['rgb']).
+    shape_feats : dict hasil features_shape.extract_shape_features(), harus
+        berisi 'contour', 'hole_contours', 'hole_meta'.
+    min_hole_confidence : lubang dengan confidence di bawah ini tidak
+        digambar (tapi TETAP terhitung di fitur holes_count untuk RF -
+        filter ini murni kosmetik).
     """
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y)
+    viz = rgb_img.copy()
+    if not shape_feats.get('is_valid', False) or shape_feats.get('contour') is None:
+        return viz
 
-    if classes is None:
-        classes = sorted(set(y))
+    cv2.drawContours(viz, [shape_feats['contour']], -1, bean_color, thickness)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    hole_contours = shape_feats.get('hole_contours', [])
+    hole_meta = shape_feats.get('hole_meta', [])
+    drawn = 0
+    for hc, meta in zip(hole_contours, hole_meta):
+        if hole_confidence(meta) >= min_hole_confidence:
+            cv2.drawContours(viz, [hc], -1, hole_color, thickness)
+            drawn += 1
 
-    pca = PCA(n_components=2, random_state=random_state)
-    X_2d = pca.fit_transform(X_scaled)
+    return viz
 
-    surrogate = RandomForestClassifier(
-        n_estimators=n_estimators, class_weight='balanced',
-        random_state=random_state, n_jobs=-1
-    )
-    surrogate.fit(X_2d, y)
 
-    x_min, x_max = X_2d[:, 0].min() - 1, X_2d[:, 0].max() + 1
-    y_min, y_max = X_2d[:, 1].min() - 1, X_2d[:, 1].max() + 1
-    xx, yy = np.meshgrid(
-        np.arange(x_min, x_max, max(mesh_step * (x_max - x_min), 1e-6)),
-        np.arange(y_min, y_max, max(mesh_step * (y_max - y_min), 1e-6)),
-    )
-
-    grid_pred = surrogate.predict(np.c_[xx.ravel(), yy.ravel()])
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    grid_idx = np.array([class_to_idx.get(c, -1) for c in grid_pred]).reshape(xx.shape)
-
-    cmap_bg = ListedColormap([_PALETTE[i % len(_PALETTE)] for i in range(len(classes))])
-
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.contourf(xx, yy, grid_idx, alpha=0.25, cmap=cmap_bg,
-                levels=np.arange(-0.5, len(classes), 1))
-
-    for i, c in enumerate(classes):
-        mask = y == c
-        ax.scatter(
-            X_2d[mask, 0], X_2d[mask, 1],
-            label=c, s=25, alpha=0.85,
-            color=_PALETTE[i % len(_PALETTE)],
-            edgecolors='black', linewidths=0.3,
-        )
-
-    var_exp = pca.explained_variance_ratio_
-    ax.set_xlabel(f"PC1 ({var_exp[0] * 100:.1f}% varians)")
-    ax.set_ylabel(f"PC2 ({var_exp[1] * 100:.1f}% varians)")
-    ax.set_title("Decision Boundary (Surrogate RF, Proyeksi PCA 2D)")
-    ax.legend(loc='best', fontsize=8, framealpha=0.9)
-    fig.tight_layout()
-
-    return fig
+def crop_bean(rgb_img, bbox, pad=5):
+    """Crop bounding-box biji dari rgb_img (pengganti 'cropped_rgb' lama)."""
+    if bbox is None:
+        return rgb_img
+    x, y, w, h = bbox
+    img_h, img_w = rgb_img.shape[:2]
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(img_w, x + w + pad), min(img_h, y + h + pad)
+    cropped = rgb_img[y1:y2, x1:x2]
+    return cropped if cropped.size > 0 else rgb_img

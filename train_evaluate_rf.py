@@ -40,7 +40,6 @@ Cara pakai:
 import argparse
 import os
 
-import joblib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -51,9 +50,10 @@ import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, train_test_split, cross_validate
 from sklearn.metrics import (
-    classification_report, confusion_matrix, f1_score, accuracy_score
+    classification_report, confusion_matrix, f1_score, accuracy_score, make_scorer
 )
 from sklearn.utils import resample
+from sklearn.preprocessing import LabelEncoder
 
 from utils.label_mapping import FINAL_CLASSES
 
@@ -135,9 +135,60 @@ def get_feature_columns(df):
     return [c for c in df.columns if c not in non_feature and not c.startswith('_')]
 
 
+def tune_hyperparameters(X_train, y_train, use_smote, n_splits, random_state,
+                          n_estimators=150):
+    """
+    Grid search kecil atas max_depth & min_samples_leaf, dievaluasi dengan
+    CV leak-free yang sama (SMOTE di dalam pipeline, per fold). Menjawab
+    kasus "F1 malah turun setelah pakai max_depth=18/min_samples_leaf=2":
+    nilai itu adalah asumsi tetap yang cocok untuk data uji kami, TAPI
+    tidak dijamin optimal untuk distribusi/noise fitur pada data Anda.
+    Alih-alih menebak satu nilai tetap, cari yang benar-benar terbaik di
+    macro-F1 CV pada data Anda sendiri.
+
+    n_estimators sengaja lebih kecil dari model final (150 vs 300) & CV
+    dibatasi 3-fold selama pencarian saja, murni supaya proses pencarian
+    tetap cepat -- setelah parameter terbaik ditemukan, model final &
+    CV pelaporan tetap dijalankan dengan n_estimators/n_splits penuh.
+    """
+    grid = [
+        {'max_depth': None, 'min_samples_leaf': 1},
+        {'max_depth': 25, 'min_samples_leaf': 1},
+        {'max_depth': 18, 'min_samples_leaf': 2},
+        {'max_depth': 12, 'min_samples_leaf': 2},
+    ]
+    search_splits = min(3, n_splits)
+    skf = StratifiedKFold(n_splits=search_splits, shuffle=True, random_state=random_state)
+
+    best_score, best_params = -1, None
+    print("\nMencari hyperparameter terbaik (grid search, leak-free CV)...")
+    for params in grid:
+        fold_scores = []
+        for tr_idx, val_idx in skf.split(X_train, y_train):
+            pipe = make_smote_rf_pipeline(
+                y_train[tr_idx], random_state=random_state, n_estimators=n_estimators,
+                max_depth=params['max_depth'], min_samples_leaf=params['min_samples_leaf']
+            ) if use_smote else RandomForestClassifier(
+                n_estimators=n_estimators, class_weight='balanced',
+                random_state=random_state, n_jobs=-1, **params
+            )
+            pipe.fit(X_train[tr_idx], y_train[tr_idx])
+            pred = pipe.predict(X_train[val_idx])
+            fold_scores.append(f1_score(y_train[val_idx], pred, average='macro'))
+        mean_score = float(np.mean(fold_scores))
+        print(f"  max_depth={params['max_depth']}, min_samples_leaf={params['min_samples_leaf']} "
+              f"-> macro-F1 CV = {mean_score:.4f}")
+        if mean_score > best_score:
+            best_score, best_params = mean_score, params
+
+    print(f"Terbaik: {best_params} (macro-F1 CV = {best_score:.4f})")
+    return best_params
+
+
 def train_and_evaluate(csv_path, output_dir='outputs', undersample_target=1200,
                         use_smote=True, n_splits=5, random_state=42,
-                        n_estimators=300, max_depth=18, min_samples_leaf=2):
+                        n_estimators=300, max_depth=18, min_samples_leaf=2,
+                        auto_tune=False):
     os.makedirs(output_dir, exist_ok=True)
 
     df = pd.read_csv(csv_path)
@@ -154,6 +205,7 @@ def train_and_evaluate(csv_path, output_dir='outputs', undersample_target=1200,
     print(df_balanced['class_name'].value_counts())
 
     feature_cols = get_feature_columns(df_balanced)
+    print(f"\nJumlah kolom fitur terpakai: {len(feature_cols)}")
     X = df_balanced[feature_cols].values
     y = df_balanced['class_name'].values
 
@@ -164,6 +216,13 @@ def train_and_evaluate(csv_path, output_dir='outputs', undersample_target=1200,
     )
     print(f"\nUkuran train set (sebelum SMOTE): {len(X_train)}")
     print(f"Ukuran test set (hold-out murni): {len(X_test)}")
+
+    if auto_tune:
+        best_params = tune_hyperparameters(
+            X_train, y_train, use_smote, n_splits, random_state, n_estimators
+        )
+        max_depth = best_params['max_depth']
+        min_samples_leaf = best_params['min_samples_leaf']
 
     # ── Stratified K-Fold CV YANG BENAR: SMOTE di dalam pipeline, fit HANYA
     #    pada train-fold; validasi-fold selalu data asli. Ini memperbaiki
@@ -252,21 +311,6 @@ def train_and_evaluate(csv_path, output_dir='outputs', undersample_target=1200,
 
     importances.to_csv(os.path.join(output_dir, "feature_importance.csv"))
 
-    # ── Simpan model untuk dipakai app.py (WAJIB - sebelumnya terlewat,
-    #    menyebabkan app.py tidak pernah menemukan file model & selalu
-    #    fallback ke Rule-based saja). PENTING: yang disimpan adalah
-    #    final_clf (RandomForest murni), BUKAN final_pipe - karena SMOTE
-    #    hanya boleh dijalankan saat training, tidak pernah saat inference. ──
-    model_path = os.path.join(output_dir, "coffee_bean_rf_7class.pkl")
-    bundle = {
-        'model': final_clf,
-        'feature_columns': feature_cols,
-        'classes': list(final_clf.classes_),
-    }
-    joblib.dump(bundle, model_path)
-    print(f"\nModel disimpan di: {model_path}")
-    print("-> app.py akan otomatis mendeteksi file ini dan mengaktifkan mode Machine Learning.")
-
     return {
         'model': final_clf,
         'accuracy': acc,
@@ -274,7 +318,6 @@ def train_and_evaluate(csv_path, output_dir='outputs', undersample_target=1200,
         'cv_macro_f1_mean': float(np.mean(cv_macro_f1)),
         'cv_macro_f1_std': float(np.std(cv_macro_f1)),
         'feature_columns': feature_cols,
-        'model_path': model_path,
     }
 
 
@@ -290,6 +333,10 @@ def main():
     parser.add_argument('--max-depth', type=int, default=18,
                          help="Batasi kedalaman pohon agar tidak overfit ke noise SMOTE")
     parser.add_argument('--min-samples-leaf', type=int, default=2)
+    parser.add_argument('--auto-tune', action='store_true',
+                         help="Grid search max_depth/min_samples_leaf berdasar macro-F1 CV "
+                              "leak-free di data Anda sendiri, alih-alih pakai nilai tetap "
+                              "18/2 yang belum tentu optimal untuk semua dataset.")
     args = parser.parse_args()
 
     if not os.path.exists(args.csv):
@@ -306,6 +353,7 @@ def main():
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         min_samples_leaf=args.min_samples_leaf,
+        auto_tune=args.auto_tune,
     )
 
 

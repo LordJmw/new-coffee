@@ -108,13 +108,79 @@ def apply_threshold(gray_image, method='otsu'):
     return binary
 
 
+def _largest_contour_solidity(binary_img):
+    """Solidity kontur terluar terbesar - dipakai sebagai skor kualitas segmentasi
+    (kontur yang gagal mengelilingi biji secara utuh biasanya solidity-nya jatuh,
+    karena bagian yang 'tergigit' membuat bentuknya cekung/bergerigi)."""
+    cnts, hierarchy = cv2.findContours(binary_img, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts or hierarchy is None:
+        return -1.0, None
+    main_idx, max_area = -1, 0
+    for i in range(len(cnts)):
+        if hierarchy[0][i][3] == -1:
+            a = cv2.contourArea(cnts[i])
+            if a > max_area:
+                max_area, main_idx = a, i
+    if main_idx == -1 or max_area < 500:
+        return -1.0, None
+    hull_area = cv2.contourArea(cv2.convexHull(cnts[main_idx]))
+    solidity = max_area / hull_area if hull_area > 0 else 0
+    return solidity, cnts[main_idx]
+
+
+def apply_threshold_adaptive_channel(rgb_image, gray_image, method='otsu'):
+    """
+    REVISI - jawaban temuan "kontur hijau gagal mengelilingi biji rusak
+    secara utuh": Otsu pada GRAYSCALE menganggap bagian dalam biji yang
+    pucat/terang (umum pada Broken/Cut/Severe Insect Damage) sebagai
+    background, karena background & bagian pucat biji sama-sama "terang"
+    di grayscale.
+
+    Otsu pada kanal SATURATION (HSV) lebih tahan terhadap kasus ini:
+    background kertas/kain biasanya betul-betul TIDAK berwarna (saturasi
+    ~0), sedangkan bagian biji yang pucat sekalipun biasanya masih punya
+    sedikit rona coklat/krem (saturasi > 0) -> lebih mudah dipisahkan dari
+    background walau kecerahannya mirip.
+
+    TAPI saturation-Otsu tidak selalu menang (terbukti empiris: kelas
+    Shell - kulit tanduk tipis & pucat - justru saturasinya sendiri sudah
+    rendah, mendekati background). Jadi dipakai ADAPTIVE CHANNEL SELECTION:
+    coba kedua metode, pilih yang solidity konturnya lebih tinggi (proxy
+    "kontur lebih mulus/utuh, bukan bergerigi/tergigit").
+
+    (Catatan: classical cv2.adaptiveThreshold/local-window thresholding
+    SUDAH DIUJI dan justru lebih buruk untuk kasus ini - patch pucat yang
+    besar & lokal-uniform tetap dianggap "background" relatif terhadap
+    jendela lokalnya sendiri, kontur malah pecah jadi beberapa fragmen di
+    DALAM biji. Karena itu tidak dipakai di sini.)
+    """
+    gray_binary = apply_threshold(gray_image, method=method)
+    sol_gray, _ = _largest_contour_solidity(gray_binary)
+
+    hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+    sat = hsv[..., 1]
+    if method == 'otsu':
+        _, sat_binary = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        _, sat_binary = cv2.threshold(sat, 60, 255, cv2.THRESH_BINARY)
+    sol_sat, _ = _largest_contour_solidity(sat_binary)
+
+    if sol_sat > sol_gray:
+        return sat_binary, 'saturation'
+    return gray_binary, 'grayscale'
+
+
 def preprocess_pipeline(image_array, target_size=(224, 224), blur_kernel=(5, 5),
                          threshold_method='otsu', interpolation_method="Area-based",
-                         normalize_illum=True):
+                         normalize_illum=True, adaptive_channel_threshold=True):
     """
     Pipeline preprocessing single-scale (koordinat kontur sinkron dengan
     koordinat warna). Ditambah normalisasi iluminasi opsional (default aktif)
     sebelum grayscale/threshold, agar segmentasi lebih stabil lintas domain.
+
+    adaptive_channel_threshold=True (default, direkomendasikan): pilih
+    otomatis antara Otsu-grayscale vs Otsu-saturation per gambar, mana yang
+    solidity konturnya lebih baik - lihat apply_threshold_adaptive_channel().
     """
     img_original = load_and_convert(image_array)
     img_rgb_raw = downsample_image(img_original, target_size, interpolation_method)
@@ -123,7 +189,14 @@ def preprocess_pipeline(image_array, target_size=(224, 224), blur_kernel=(5, 5),
 
     img_gray = rgb_to_grayscale(img_rgb)
     img_blur = apply_gaussian_blur(img_gray, blur_kernel)
-    img_binary = apply_threshold(img_blur, threshold_method)
+
+    if adaptive_channel_threshold:
+        img_binary, channel_used = apply_threshold_adaptive_channel(
+            img_rgb, img_blur, method=threshold_method
+        )
+    else:
+        img_binary = apply_threshold(img_blur, threshold_method)
+        channel_used = 'grayscale'
 
     results = {
         'rgb': img_rgb,               # ternormalisasi -> dipakai fitur warna & tampilan UI
@@ -131,6 +204,7 @@ def preprocess_pipeline(image_array, target_size=(224, 224), blur_kernel=(5, 5),
         'gray': img_gray,
         'blur': img_blur,
         'binary': img_binary,
+        'segmentation_channel': channel_used,   # untuk debugging/laporan: 'grayscale' atau 'saturation'
         'original_rgb': img_original,
         'target_size': target_size,
     }

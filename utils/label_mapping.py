@@ -9,6 +9,8 @@ dipetakan eksplisit lewat FOLDER_TO_SUBCLASS agar tetap tertelusuri ke SNI.
 """
 
 # folder dataset -> (nama subkelas asli, kelas final 7-kelas)
+
+# folder dataset -> (nama subkelas asli, kelas final 7-kelas)
 FOLDER_TO_SUBCLASS = {
     "Normal":               ("Normal",                "Normal"),
     "Full Sour":             ("Full Sour",             "Sour"),
@@ -30,6 +32,7 @@ FOLDER_TO_SUBCLASS = {
     "Fungus Damage":         ("Fungus Damage",         "Foreign Material/Processing"),
 }
 
+
 # Urutan kelas final tetap (dipakai untuk label encoding & tampilan laporan/CM)
 FINAL_CLASSES = [
     "Normal",
@@ -40,26 +43,26 @@ FINAL_CLASSES = [
     "Immature/Discoloration",
     "Foreign Material/Processing",
 ]
- 
+
 FINAL_CLASS_TO_NUM = {name: i for i, name in enumerate(FINAL_CLASSES)}
 NUM_TO_FINAL_CLASS = {i: name for name, i in FINAL_CLASS_TO_NUM.items()}
- 
- 
+
+
 # Reverse index: nama subkelas asli (mis. "Full Sour", "Severe Insect Damage")
 # -> kelas final. Dibutuhkan karena beberapa arsip dataset memakai nama folder
 # = nama subkelas langsung (tanpa suffix " bean"), mis. train.zip.
 SUBCLASS_TO_FINAL = {sub: final for sub, final in FOLDER_TO_SUBCLASS.values()}
 SUBCLASS_NAMES_LOOKUP = {sub.lower(): sub for sub, _ in FOLDER_TO_SUBCLASS.values()}
- 
- 
+
+
 def _normalize_folder_name(folder_name: str) -> str:
     """Bersihkan variasi penulisan nama folder (spasi, suffix ' bean', kapital)."""
     name = folder_name.strip().lower()
     if name.endswith(" bean"):
         name = name[: -len(" bean")]
     return name.strip()
- 
- 
+
+
 def resolve_folder(folder_name: str):
     """
     Cocokkan nama folder dataset ke (subclass_name, final_class), menerima
@@ -73,16 +76,16 @@ def resolve_folder(folder_name: str):
     for key, (sub, final) in FOLDER_TO_SUBCLASS.items():
         if key.lower() == key_lower:
             return sub, final
- 
+
     # Konvensi 2: nama folder == nama subkelas asli
     normalized = _normalize_folder_name(folder_name)
     if normalized in SUBCLASS_NAMES_LOOKUP:
         sub = SUBCLASS_NAMES_LOOKUP[normalized]
         return sub, SUBCLASS_TO_FINAL[sub]
- 
+
     return None
- 
- 
+
+
 def get_final_class(folder_name: str) -> str:
     """Kembalikan kelas final (7 kelas) dari nama folder dataset."""
     resolved = resolve_folder(folder_name)
@@ -92,8 +95,8 @@ def get_final_class(folder_name: str) -> str:
             f"tambahkan mapping baru di FOLDER_TO_SUBCLASS."
         )
     return resolved[1]
- 
- 
+
+
 def get_subclass(folder_name: str) -> str:
     """Kembalikan nama subkelas asli (granular, 17+1) dari nama folder dataset."""
     resolved = resolve_folder(folder_name)
